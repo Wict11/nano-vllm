@@ -142,7 +142,7 @@ class Scheduler:
         #     return scheduled_seqs, True
 
         # decode
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and num_seqs < self.max_num_seqs and not has_prefill:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 # 如果添加不了新的block块了，启动抢占逻辑
