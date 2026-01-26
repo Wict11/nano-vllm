@@ -1,17 +1,20 @@
 # Nano-vLLM
 
-A lightweight vLLM implementation built from scratch.
+基于nana-vLLM，支持Qwen3、Qwen-MoE、LLama2的模型，添加chunked prefill功能。
 
-## Key Features
+后续持续添加其他功能。。
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+## Chunked Prefilled Code Introduction
+
+* 🚀 **Scheduler layer** - 为长序列切分chunk并添加至调度队列，优先级依次是：running队列中的prefill阶段序列、waiting队列中的序列、running队列中decode阶段的序列
+* 📖 **LLM engine layer** - 额外传入num_prefill_tokens和num_decode_tokens数据，区分混合prefill和decode的批次
+* 💡 **Attention layer** - 针对混合批次，分别调用flash attn的函数接口来处理，最后合并数据并返回
+* 💡 **Post progress** - 只有decode阶段序列要计算logits和更新产生的token
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install git+https://github.com/Wict11/nano-vllm.git
 ```
 
 ## Manual Download
@@ -37,22 +40,23 @@ outputs[0]["text"]
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `base_chunk_v4.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
+- Hardware: A10 (24GB)
 - Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+- Total Requests: 3 sequences（for test）
+- short background flows(~20tokens): 5
+- long incast flows(~1000tokens): 5
 
 **Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+* **Disabled Chunked Prefill:**
+<img width="1198" height="437" alt="image" src="https://github.com/user-attachments/assets/953d9f9f-c954-4bd3-8d6e-602a14f8e981" />
 
-## Star History
+<img width="679" height="226" alt="image" src="https://github.com/user-attachments/assets/3d7a35a9-7d87-4cbc-a9aa-d0b250618f9e" />
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+* **Chunk_size = 512:**
+  <img width="1188" height="438" alt="image" src="https://github.com/user-attachments/assets/93109a4d-580f-4f01-991c-36cf22909430" />
+
+  <img width="736" height="201" alt="image" src="https://github.com/user-attachments/assets/4c8d25f2-900a-4152-a163-916c192f0281" />
