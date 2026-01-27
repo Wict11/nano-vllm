@@ -299,11 +299,11 @@ def plot_timeline(result: Dict[str, Any], save_path: str = None):
     plt.close()
 
 
-def main(model_path: str, chunk_size: int, save_results: str = None, save_plot: str = None):
+def main(model_path: str, chunk_size: int, save_results: str = None, save_plot: str = None, enable_chunk: bool = False):
     """主函数"""
     
     # 配置名称
-    if chunk_size >= 999999:
+    if not enable_chunk:
         config_name = f"Chunked Prefill DISABLED (chunk_size={chunk_size})"
     else:
         config_name = f"Chunked Prefill ENABLED (chunk_size={chunk_size})"
@@ -323,12 +323,12 @@ def main(model_path: str, chunk_size: int, save_results: str = None, save_plot: 
         for _ in range(5)
     ]
     
-    llm = LLM(model_path, max_model_len=8192, chunk_prefill_size=chunk_size)
+    llm = LLM(model_path, max_model_len=8192, chunk_prefill_size=chunk_size, enable_chunked_prefill = enable_chunk)
     
     # 采样参数
     sampling_params = SamplingParams(
         max_tokens=100,
-        temperature=0.0,  # greedy
+        temperature=0.01,  # greedy
     )
     
     # 运行 benchmark
@@ -357,14 +357,16 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Token generation timeline benchmark")
     parser.add_argument("--model", type=str, 
-                       default="/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
+                       default="/mnt/workspace/models/Qwen/Qwen2.5-1.5B-Instruct",
                        help="Path to model")
-    parser.add_argument("--chunk-size", type=int, default=999999, 
+    parser.add_argument("--chunk-size", type=int, default=99999, 
                        help="Chunk size for prefill (999999 to disable)")
     parser.add_argument("--save-results", type=str, default=None, 
                        help="Save results to JSON file")
     parser.add_argument("--save-plot", type=str, default="timeline_disable.png", 
                        help="Save plot to image file")
+    parser.add_argument("--enable-chunk", type=bool, default=False, 
+                       help="add this arg to Enable chunked prefill") # 加这个参数就是启用chunked prefill，不想启用直接别加
     args = parser.parse_args()
     
-    main(args.model, args.chunk_size, args.save_results, args.save_plot)
+    main(args.model, args.chunk_size, args.save_results, args.save_plot, args.enable_chunk)

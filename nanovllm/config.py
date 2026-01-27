@@ -16,9 +16,10 @@ class Config:
     eos: int = -1 # 模型的 end-of-sequence token ID，默认 -1 可稍后修改
     kvcache_block_size: int = 256 # KV cache 块大小，必须是 256 的倍数
     num_kvcache_blocks: int = -1 # KV cache 块数量，-1 表示动态计算
+    enable_chunked_prefill: bool = False # 默认不开chunked prefill
     
     # [ ] chunked prefill 相关参数
-    chunked_prefill_size: int = 1024  # chunked prefill 的大小，单位为 token 数量
+    chunked_prefill_size: int = 99999  # chunked prefill 的大小，单位为 token 数量
 
     # 做 参数验证和初始化衍生值
     def __post_init__(self):

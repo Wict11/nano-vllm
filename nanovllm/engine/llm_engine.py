@@ -39,6 +39,7 @@ class LLMEngine:
         atexit.register(self.exit)
         # [ ] chunked prefill 大小参数
         self.chunked_prefill_size = config.chunked_prefill_size
+        self.enable_chunked_prefill = config.enable_chunked_prefill
 
     def exit(self):
         self.model_runner.call("exit")

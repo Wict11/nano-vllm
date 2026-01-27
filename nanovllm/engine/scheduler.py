@@ -16,6 +16,7 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         # [ ] chunked prefill 的 chunk 大小参数
         self.chunk_size = config.chunked_prefill_size
+        self.enable_chunked_prefill = config.enable_chunked_prefill
 
     def is_finished(self):
         # 两个队列都没有序列则表示全部完成
@@ -104,36 +105,37 @@ class Scheduler:
         # decode
         # 原代码默认所有序列都完成了prefill，但是当前是把chunked prefill和decode混合在一起调度的
         # 原代码如果没有需要prefill的序列，则进行解码阶段的调度
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            # 如果无法为该序列追加块，则开始抢占
-            # [ ] 关于抢占的知识点
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    # 如果有正在运行的序列，从running队列的右侧pop一个seq并抢占资源
-                    self.preempt(self.running.pop())
+        if self.enable_chunked_prefill or not running_has_prefill:
+            while self.running and num_seqs < self.max_num_seqs :
+                seq = self.running.popleft()
+                # 如果无法为该序列追加块，则开始抢占
+                # [ ] 关于抢占的知识点
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        # 如果有正在运行的序列，从running队列的右侧pop一个seq并抢占资源
+                        self.preempt(self.running.pop())
+                    else:
+                        # 如果没有正在运行的序列，直接将当前序列抢占
+                        self.preempt(seq)
+                        break
                 else:
-                    # 如果没有正在运行的序列，直接将当前序列抢占
-                    self.preempt(seq)
-                    break
-            else:
-                if seq in scheduled_seqs:
-                    continue  # 已经调度过该序列，跳过
-                prompt_tokens_left = seq.num_prompt_tokens - seq.prefilled_tokens - seq.num_cached_tokens
-                if prompt_tokens_left > 0:
-                    # 还有prefill未完成的chunk，跳过decode调度
-                    # 放回running队列
-                    self.running.appendleft(seq)
-                    continue
-                if self.block_manager.can_allocate(seq) and num_batched_tokens + 1 <= self.max_num_batched_tokens:
-                    # 可以为该序列追加块，且不超出token数上限
-                    # BUG 只有在纯decode批次才提前分配块，混合批次不提前分配
-                    if not running_has_prefill:
-                        # 判断是否需要追加块
-                        self.block_manager.may_append(seq)
-                    num_batched_tokens += 1
-                    num_seqs += 1
-                    scheduled_seqs.append(seq)
+                    if seq in scheduled_seqs:
+                        continue  # 已经调度过该序列，跳过
+                    prompt_tokens_left = seq.num_prompt_tokens - seq.prefilled_tokens - seq.num_cached_tokens
+                    if prompt_tokens_left > 0:
+                        # 还有prefill未完成的chunk，跳过decode调度
+                        # 放回running队列
+                        self.running.appendleft(seq)
+                        continue
+                    if self.block_manager.can_allocate(seq) and num_batched_tokens + 1 <= self.max_num_batched_tokens:
+                        # 可以为该序列追加块，且不超出token数上限
+                        # BUG 只有在纯decode批次才提前分配块，混合批次不提前分配
+                        if not running_has_prefill:
+                            # 判断是否需要追加块
+                            self.block_manager.may_append(seq)
+                        num_batched_tokens += 1
+                        num_seqs += 1
+                        scheduled_seqs.append(seq)
         assert scheduled_seqs
         # 再塞回去
         self.running.extendleft(reversed(scheduled_seqs))

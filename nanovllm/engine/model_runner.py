@@ -213,8 +213,14 @@ class ModelRunner:
                     if block_idx <= len(seq.block_table):
                         slot = seq.block_table[block_idx] * self.block_size + block_offset
                         slot_mapping.append(slot)
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+        # if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
+        #     block_tables = self.prepare_block_tables(seqs)
+        # --- [关键修改] ---
+        # 移除 if cu_seqlens_k[-1] > cu_seqlens_q[-1]: 判断
+        # 只要有序列，就必须准备 block_tables，因为 flash_attn_with_kvcache 总是需要它
+        # if len(seqs) > 0:
+        #     block_tables = self.prepare_block_tables(seqs)
+            
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
