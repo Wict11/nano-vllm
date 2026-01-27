@@ -32,7 +32,10 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
+        # 先做残差连接
         x = x.float().add_(residual.float())
+
+        # 再做 RMSNorm
         residual = x.to(orig_dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
@@ -44,7 +47,9 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # 如果只有一个输入则表示普通的 RMSNorm
         if residual is None:
             return self.rms_forward(x)
+        # 否则表示 RMSNorm + 残差连接
         else:
             return self.add_rms_forward(x, residual)
