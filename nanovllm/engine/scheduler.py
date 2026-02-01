@@ -67,6 +67,7 @@ class Scheduler:
             prompt_tokens_left = seq.num_prompt_tokens - seq.prefilled_tokens - seq.num_cached_tokens
             new_chunk_size = min(self.chunk_size, prompt_tokens_left)
             # 如果加入该序列会超出token数上限，或者无法分配足够的块，则停止调度
+            # 这里的self.block_manager.can_allocate(seq)会判断全量prompt长度，不是当前chunk的长度
             if new_chunk_size > 0 and num_batched_tokens + new_chunk_size <= self.max_num_batched_tokens and self.block_manager.can_allocate(seq):
                 # 加入该序列
                 num_seqs += 1
