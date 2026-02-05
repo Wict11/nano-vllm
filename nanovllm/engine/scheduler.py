@@ -65,6 +65,7 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
+        seq.prefilled_len = 0 # 更新prefilled_len
         self.waiting.appendleft(seq)
 
     # def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
@@ -122,27 +123,43 @@ class Scheduler:
             prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
             this_chunk_size = min(prompt_remaining, CHUNK_SIZE)
             
-            # 使用实际的 chunk size 检查预算
-            if this_chunk_size > 0 and num_batched_tokens + this_chunk_size <= self.max_num_batched_tokens and self.block_manager.can_allocate(seq):
-                # ------------------ 添加chunked prefill逻辑 ------------------
-                
-                num_seqs += 1
-                self.block_manager.allocate(seq)
-                
-                seq.status = SequenceStatus.RUNNING
+            # 如果 prompt 已经完全 prefetched（prompt_remaining<=0），直接转入 running 等待 decode
+            if prompt_remaining <= 0:
                 self.waiting.popleft()
-                self.running.append(seq)
-                scheduled_seqs.append(seq)
-                num_batched_tokens += this_chunk_size  
-                has_prefill = True
-                
-                # num_batched_tokens += len(seq)  # 原始代码
-        # if scheduled_seqs:
-        #     # 如果有prefill，直接返回，后续的decode阶段留到下一次调用schedule时处理
-        #     return scheduled_seqs, True
+                seq.status = SequenceStatus.RUNNING
+                self.running.appendleft(seq)
+            else:
+                # 使用实际的 chunk size 检查预算
+                can_alloc = self.block_manager.can_allocate(seq)
+                if this_chunk_size > 0 and num_batched_tokens + this_chunk_size <= self.max_num_batched_tokens and can_alloc:
+                    num_seqs += 1
+                    self.block_manager.allocate(seq)
+
+                    seq.status = SequenceStatus.RUNNING
+                    self.waiting.popleft()
+                    self.running.append(seq)
+                    scheduled_seqs.append(seq)
+                    num_batched_tokens += this_chunk_size  
+                    has_prefill = True
+                elif not can_alloc:
+                    print(
+                        f"[SCHED DEBUG] cannot allocate KV blocks: free={len(self.block_manager.free_block_ids)}, "
+                        f"need={seq.num_blocks}, waiting={len(self.waiting)}, running={len(self.running)}"
+                    )
+                elif this_chunk_size <= 0:
+                    print(f"[SCHED DEBUG] zero chunk size for seq {seq.seq_id}, prompt_remaining={prompt_remaining}, chunk_size_cfg={CHUNK_SIZE}")
+                else:
+                    print(
+                        f"[SCHED DEBUG] token budget exceeded: num_batched_tokens={num_batched_tokens}, "
+                        f"chunk={this_chunk_size}, max={self.max_num_batched_tokens}"
+                    )
+
+        can_append_decode = False
+        if self.chunk_size < 999999 or not has_prefill:
+            can_append_decode = True
 
         # decode
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and num_seqs < self.max_num_seqs and can_append_decode:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 # 如果添加不了新的block块了，启动抢占逻辑
@@ -183,6 +200,8 @@ class Scheduler:
                 # num_seqs += 1
                 # self.block_manager.may_append(seq)
                 # scheduled_seqs.append(seq)
+        if not scheduled_seqs:
+            print(f"scheduled seqs EMPTY! running_seqs: {len(self.running)}, waiting_Seqs:{len(self.waiting)}")
         assert scheduled_seqs
         # running队列extendleft从队列左侧添加
         # scheduled_seqs是按顺序添加的，例如[seq1,seq2,seq3]，running里还剩seq4,seq5没被选取到

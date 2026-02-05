@@ -73,20 +73,7 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-        #     if context.block_tables is not None:  # prefix cache
-        #         k, v = k_cache, v_cache
-        #     o = flash_attn_varlen_func(
-        #         q,
-        #         k,
-        #         v,
-        #         max_seqlen_q=context.max_seqlen_q,
-        #         cu_seqlens_q=context.cu_seqlens_q,
-        #         max_seqlen_k=context.max_seqlen_k,
-        #         cu_seqlens_k=context.cu_seqlens_k,
-        #         softmax_scale=self.scale,
-        #         causal=True,
-        #         block_table=context.block_tables,
-        #     )
+
         # 检查是否是混合批次（prefill + decode）
             # is_mixed = context.num_prefill_tokens > 0 and context.num_decode_tokens > 0
             # 需要确保字段存在且有效
@@ -107,17 +94,40 @@ class Attention(nn.Module):
                 num_prefill = context.num_prefill_tokens
                 num_decode = context.num_decode_tokens
                 
+                # 计算有多少个 prefill 序列（基于 cu_seqlens_q 判断）
+                # cu_seqlens_q[i+1] 是第 i 个序列的结束位置，若 <= num_prefill，则该序列是 prefill
+                num_prefill_seqs = 0
+                if hasattr(context, 'cu_seqlens_q') and context.cu_seqlens_q is not None:
+                    for i in range(len(context.cu_seqlens_q) - 1):
+                        # 检查序列的结束位置是否在 prefill 范围内
+                        if context.cu_seqlens_q[i + 1] <= num_prefill:
+                            num_prefill_seqs += 1
+                        else:
+                            break
+                
                 # 分离 prefill 和 decode 部分
                 q_prefill = q[:num_prefill]
                 q_decode = q[num_prefill:]
                 k_prefill = k[:num_prefill]
                 v_prefill = v[:num_prefill]
+                              
+                if context.block_tables is not None:    # prefix cache
+                    k_prefill, v_prefill = k_cache, v_cache
                 
                 # 处理 prefill 部分 - 使用 varlen
                 # 构建 prefill 的 cu_seqlens
                 # 处理 prefill 部分 - 使用 varlen
                 # 构建 prefill 的 cu_seqlens，基于实际的 prefill token 数量
                 cu_seqlens_prefill = torch.tensor([0, num_prefill], device=q.device, dtype=torch.int32)
+                # o_prefill = flash_attn_varlen_func(
+                #     q_prefill, k_prefill, v_prefill,
+                #     max_seqlen_q=num_prefill,
+                #     cu_seqlens_q=cu_seqlens_prefill,
+                #     max_seqlen_k=num_prefill,
+                #     cu_seqlens_k=cu_seqlens_prefill,
+                #     softmax_scale=self.scale,
+                #     causal=True
+                # )
                 o_prefill = flash_attn_varlen_func(
                     q_prefill, k_prefill, v_prefill,
                     max_seqlen_q=num_prefill,
@@ -125,17 +135,24 @@ class Attention(nn.Module):
                     max_seqlen_k=num_prefill,
                     cu_seqlens_k=cu_seqlens_prefill,
                     softmax_scale=self.scale,
+                    # block_table=context.block_tables[:1],  # 仅 prefill 部分使用 block_table
+                    block_table=context.block_tables[:num_prefill_seqs] if context.block_tables is not None and num_prefill_seqs > 0 else None,
                     causal=True
                 )
                 
                 # 处理 decode 部分 - 使用 kvcache
-                # decode 序列从 cache 读取历史 KV
+                # decode 序列从 cache 读取历史 
+                # 处理 decode 部分 - 使用 kvcache
+                # 正确切分 decode 序列的 context_lens 和 block_table
+                decode_context_lens = context.context_lens[num_prefill_seqs:] if context.context_lens is not None else None
+                decode_block_tables = context.block_tables[num_prefill_seqs:] if context.block_tables is not None else None
+                
                 o_decode = flash_attn_with_kvcache(
                     q_decode.unsqueeze(1),  # (num_decode, 1, num_heads, head_dim)
                     k_cache,
                     v_cache,
-                    cache_seqlens=context.context_lens[1:] if context.context_lens is not None else None,
-                    block_table=context.block_tables[1:] if context.block_tables is not None else None,
+                    cache_seqlens=decode_context_lens,
+                    block_table=decode_block_tables,
                     softmax_scale=self.scale,
                     causal=True
                 ).squeeze(1)
@@ -155,7 +172,7 @@ class Attention(nn.Module):
                     q, k, v,
                     max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                     max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                    softmax_scale=self.scale, causal=True
+                    softmax_scale=self.scale, block_table=context.block_tables, causal=True
                 )
         else:  # decode
             o = flash_attn_with_kvcache(

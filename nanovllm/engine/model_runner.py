@@ -1,7 +1,7 @@
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
-
+from time import perf_counter
 import torch
 import torch.distributed as dist
 
@@ -110,37 +110,48 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        # 清理缓存，避免上一个实例的缓存影响可用显存估算
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # 重新获取显存状态（清理后）
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        
+        # 计算每个KV块所需的字节数，并根据剩余显存计算可分配的KV块数量
+        # 一个block的大小计算公式： 
+        # block_bytes = 2 * num_hidden_layers * block_size * num_kv_heads * head_dim * dtype_size
+        #           K、V各占一个     层数     一个block的token数    KV头数      每个头的维度    每参数字节数
+        # 2*层数*一个block的token数：代表一个block一共存储多少个KV向量
+        # kv头数*每头维度*每参数字节数：代表一个KV向量占用多少字节
+        # 每头维度，如果hf_config有head_dim属性就用它，否则用hidden_size/num_attention_heads计算
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        assert hf_config.hidden_size % hf_config.num_attention_heads == 0
-        head_dim = (
-            hf_config.head_dim
-            if hasattr(hf_config, "head_dim")
-            else hf_config.hidden_size // hf_config.num_attention_heads
-        )
-        block_bytes = (
-            2
-            * hf_config.num_hidden_layers
-            * self.block_size
-            * num_kv_heads
-            * head_dim
-            * hf_config.torch_dtype.itemsize
-        )
-        config.num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        
+        # 使用更准确的可用显存估算：可分配显存 = 总显存 * 利用率 - 当前已分配
+        available_memory = int(total * config.gpu_memory_utilization) - current
+        config.num_kvcache_blocks = available_memory // block_bytes
+        
+        # 记录KV缓存预算，便于排查因块数不足导致的非法访存
+        total_gb = total / (1024 ** 3)
+        avail_mb = available_memory / (1024 ** 2)
+        block_mb = block_bytes / (1024 ** 2)
+        total_token_capacity = config.num_kvcache_blocks * self.block_size
+        
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.zeros(
-            2,
-            hf_config.num_hidden_layers,
-            config.num_kvcache_blocks,
-            self.block_size,
-            num_kv_heads,
-            head_dim,
+        if config.num_kvcache_blocks <= 0:
+            # 回退为至少1块并给出提示，避免直接断言导致无法实例化
+            config.num_kvcache_blocks = 1
+            print("[WARN] 可用显存不足按估算无法分配KV缓存，已回退为1个KV块。建议调小 max_model_len / chunk_prefill_size 或降低gpu_memory_utilization。")
+
+        # 创建KV缓存张量（在 GPU 上），并分配给模型的每一层
+        self.kv_cache = torch.empty(
+            2, hf_config.num_hidden_layers, config.num_kvcache_blocks, 
+            self.block_size, num_kv_heads, head_dim,
+            dtype=hf_config.torch_dtype,
+            device='cuda' # 显式指定在GPU上创建，防止CUDA非法内存访问
         )
         layer_id = 0
         for module in self.model.modules():
@@ -152,7 +163,8 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [
-            seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs
+            seq.block_table + [0] * (max_len - len(seq.block_table)) for seq in seqs
+            # 这里改成了填0️⃣
         ]
         block_tables = torch.tensor(
             block_tables, dtype=torch.int32, pin_memory=True
@@ -321,6 +333,7 @@ class ModelRunner:
         # input_ids, positions = (
         #     self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         # )
+        t0 = perf_counter()
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs, num_prefill_tokens, num_decode_tokens)
         else:
@@ -333,8 +346,11 @@ class ModelRunner:
                 remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
                 # print(f"  Seq[{i}] id={seq.seq_id}: remaining={remaining}, total_tokens={len(seq)}")
             # print(f"  input_ids.shape: {input_ids.shape}")
-        
+        t1 = perf_counter()
+        # print(f"prepare_prefill/decode time: {(t1 - t0) * 1000:.2f}ms")
         logits = self.run_model(input_ids, positions, is_prefill)
+        t2 = perf_counter()
+        # print(f"run model time: {(t2 - t1) * 1000:.2f}ms")
 
 
         if is_prefill and len(seqs) > 1:
@@ -354,6 +370,8 @@ class ModelRunner:
         token_ids = (
             self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         )
+        t3 = perf_counter()
+        # print(f"sample time: {(t3 - t2) * 1000:.2f}ms")
         reset_context()
         return token_ids
 
@@ -520,10 +538,30 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if context_lens else None
+        
+        # 额外打印当前批次涉及的KV占用，辅助定位是否接近KV块上限
+        # all_block_ids = [bid for seq in seqs for bid in seq.block_table]
+        # max_block_id = max(all_block_ids) if all_block_ids else -1
+        # unique_blocks = len(set(all_block_ids))
+        # est_tokens_in_cache = unique_blocks * self.block_size
+        # print(
+        #     f"[KVCache batch] seqs={len(seqs)}, unique_blocks={unique_blocks}, "
+        #     f"max_block_id={max_block_id}, est_cached_tokens≈{est_tokens_in_cache}, "
+        #     f"block_capacity={self.config.num_kvcache_blocks * self.block_size}"
+        # )
+        
+        # 如果传入的 num_prefill_tokens 和 num_decode_tokens 都是 0（如 warmup 时），
+        # 则根据实际的 cu_seqlens_q 推断真实的 token 数量
+        if num_prefill_tokens == 0 and num_decode_tokens == 0:
+            total_tokens = cu_seqlens_q[-1].item() if isinstance(cu_seqlens_q, torch.Tensor) else cu_seqlens_q[-1]
+            # 纯 prefill 批次：所有 token 都是 prefill
+            num_prefill_tokens = total_tokens
+            num_decode_tokens = 0
         # 设置全局的上下文，信息包括：是否是prefill阶段、累计的序列长度、最大序列长度、映射表、块表等
         # 用于后续模型的前向计算，特别是处理缓存和attention机制时使用
         # set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
          # 额外传递混合批次信息：num_prefill_tokens, num_decode_tokens, context_lens
+        print(f"[DEBUG prepare_prefill] calling set_context with is_prefill=True, num_prefill={num_prefill_tokens}, num_decode={num_decode_tokens}")
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables,
                    num_prefill_tokens=num_prefill_tokens, num_decode_tokens=num_decode_tokens)
         ctx = get_context()
